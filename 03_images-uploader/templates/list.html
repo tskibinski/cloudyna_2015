@@ -1,0 +1,16 @@
+{% extends "layout.html" %}
+{% block body %}
+    <b>Number of images: {{ rows|length }}</b>
+    <table>
+    {% for row in rows|batch(4) %}
+      <tr>
+      {% for item in row %}
+      <td><a href="https://s3-{{ region_name }}.amazonaws.com/{{ bucket_name }}/{{ item[2] }}" _target="self">
+        <img src="https://s3-{{ region_name }}.amazonaws.com/{{ bucket_name }}/{{ item[1] }}" />
+      </a></td>
+      {% endfor %}
+      </tr>
+    {% endfor %}
+    </table>
+    <p><a href="{{ url_for('main') }}">Return to home</a>
+{% endblock %}

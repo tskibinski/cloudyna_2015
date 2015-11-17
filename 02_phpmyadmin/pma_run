@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+[ -z "${DB_HOST}" ] && { echo "\$DB_HOST is not set" ; exit 1; } || sed -i "s/'localhost'/'${DB_HOST}'/" /usr/share/nginx/phpmyadmin/config.inc.php
+
+sed -i "s/\\$cfg['blowfish_secret'].*/\\$cfg['blowfish_secret'] = '$(openssl rand -hex 20)';/g" /usr/share/nginx/phpmyadmin/config.inc.php
+sed -i "s#// \\$cfg['Servers'][\\$i]['pmadb'] = 'phpmyadmin';#\\$cfg['Servers'][\\$i]['pmadb'] = 'phpmyadmin';#" /usr/share/nginx/phpmyadmin/config.inc.php
+
+/etc/init.d/php5-fpm start
+/etc/init.d/nginx start

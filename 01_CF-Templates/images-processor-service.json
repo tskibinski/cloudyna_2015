@@ -1,0 +1,202 @@
+{
+    "AWSTemplateFormatVersion" : "2010-09-09",
+    "Description" : "CloudFormation template for Images-Processor ECS service",
+
+    "Parameters" : {
+        "ClusterStackName" : {
+            "Description" : "Name of Stack this should get outputs from.",
+            "MinLength" : 1,
+            "Type" : "String"
+        },
+        "ContainerCpuUnits" : {
+            "Description" : "The minimum number of CPU units to reserve for the container",
+            "Type" : "Number",
+            "Default" : "100"
+        },
+        "ContainerImage" : {
+            "Description" : "The image to use for a container",
+            "Type" : "String",
+            "Default" : "tskibinski/ip:latest"
+        },
+        "ContainerMemory" : {
+            "Description" : "The number of MiB of memory to reserve for the container",
+            "Type" : "Number",
+            "Default" : "150"
+        },
+        "DBPassword" : {
+            "Description" : "Database admin account password",
+            "Type" : "String",
+            "NoEcho" : "true",
+            "MinLength" : "8",
+            "MaxLength" : "41",
+            "AllowedPattern" : "[a-zA-Z0-9]*",
+            "ConstraintDescription" : "must contain only alphanumeric characters."
+        },
+        "DBUser" : {
+            "Description" : "Database admin account name",
+            "Type" : "String",
+            "NoEcho" : "true",
+            "MinLength" : "1",
+            "MaxLength" : "16",
+            "AllowedPattern" : "[a-zA-Z][a-zA-Z0-9]*",
+            "ConstraintDescription" : "must begin with a letter and contain only alphanumeric characters."
+        },
+        "ImageWatermark" : {
+            "Description" : "Image watermark",
+            "Type" : "String"
+        },
+        "ServiceDesiredCount" : {
+            "Description" : "The number of simultaneous tasks (application containers) to run in the cluster",
+            "Type" : "Number",
+            "Default" : "1"
+        },
+        "ServiceIsActive" : {
+            "Description" : "Will start a seperate service / task that runs cron.",
+            "Type" : "String",
+            "Default" : "Yes",
+            "AllowedValues" : [ "Yes", "No" ]
+        },
+        "ServiceName" : {
+            "Description" : "Name of the application running as ECS service",
+            "Type" : "String",
+            "Default" : "ImagesProcessor"
+        }
+    },
+
+    "Conditions" : {
+        "isActive" : { "Fn::Equals" : [ { "Ref" : "ServiceIsActive" }, "Yes" ] }
+    },
+
+    "Resources" : {
+        "LambdaCrossStackFunction" : {
+            "Type" : "AWS::Lambda::Function",
+            "Properties" : {
+                "Code" : {
+                    "ZipFile" : "\nvar response = require('cfn-response');\nexports.handler = function(event, context) {\n    console.log('REQUEST RECEIVED:\\n', JSON.stringify(event));\n    if (event.RequestType == 'Delete') {\n        response.send(event, context, response.SUCCESS);\n        return;\n    }\n    var stackName = event.ResourceProperties.ReferenceStackName;\n    var responseData = {};\n    if (stackName) {\n        var aws = require('aws-sdk');\n        var cfn = new aws.CloudFormation();\n        cfn.describeStacks({StackName: stackName}, function(err, data) {\n            if (err) {\n                responseData = {Error: 'DescribeStacks call failed'};\n                console.log(responseData.Error + ':\\n', err);\n                response.send(event, context, response.FAILED, responseData);\n            }\n            else {\n                data.Stacks[0].Outputs.forEach(function(output) {\n                    responseData[output.OutputKey] = output.OutputValue;\n                });\n                response.send(event, context, response.SUCCESS, responseData);\n            }\n        });\n    } else {\n        responseData = {Error: 'Stack name not specified'};\n        console.log(responseData.Error);\n        response.send(event, context, response.FAILED, responseData);\n    }\n}\n"
+                },
+                "Description" : "Lambda function that pulls information from other stacks",
+                "Handler" : "index.handler",
+                "Role" : { "Fn::GetAtt" : [ "LambdaCrossStackRole", "Arn" ] },
+                "Runtime" : "nodejs",
+                "Timeout" : "60"
+            }
+        },
+        "LambdaCrossStackRole" : {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+                "AssumeRolePolicyDocument" : {
+                  "Statement" : [
+                      {
+                          "Action" : [ "sts:AssumeRole" ],
+                          "Effect" : "Allow",
+                          "Principal" : {
+                              "Service" : [ "lambda.amazonaws.com" ]
+                          }
+                      }
+                  ],
+                  "Version" : "2012-10-17"
+                },
+                "Path" : "/",
+                "Policies" : [
+                    {
+                        "PolicyDocument" : {
+                          "Statement" : [
+                              {
+                                  "Action" : [ "logs:*" ],
+                                  "Effect" : "Allow",
+                                  "Resource" : [ "*" ]
+                              },
+                              {
+                                  "Action" : [ "cloudformation:DescribeStacks" ],
+                                  "Effect" : "Allow",
+                                  "Resource" : [ "*" ]
+                              }
+                          ],
+                          "Version" : "2012-10-17"
+                        },
+                        "PolicyName" : "ECSInstancePolicy"
+                    }
+                ]
+            }
+        },
+        "LBRCrossStackReferencer" : {
+            "Type" : "Custom::LBRCrossStackReferencer",
+            "Properties" : {
+                "ReferenceStackName" : { "Ref" : "ClusterStackName" },
+                "ServiceToken" : { "Fn::GetAtt" : [ "LambdaCrossStackFunction", "Arn" ] },
+                "Version" : "1"
+            }
+        },
+        "Taskdefinition" : {
+            "Type" : "AWS::ECS::TaskDefinition",
+            "Properties" : {
+                "ContainerDefinitions" : [
+                    {
+                        "Name" : { "Ref" : "ServiceName" },
+                        "Cpu" : { "Ref" : "ContainerCpuUnits" },
+                        "Memory" : { "Ref" : "ContainerMemory" },
+                        "Essential" : "true",
+                        "Image" : { "Ref" : "ContainerImage" },
+                        "Environment" : [
+                            {
+                                "Name" : "SQS_QUEUE_NAME",
+                                "Value" : { "Fn::GetAtt" : [ "LBRCrossStackReferencer", "ImagesQueue" ] }
+                            },
+                            {
+                                "Name" : "S3_BUCKET_NAME",
+                                "Value" : { "Fn::GetAtt" : [ "LBRCrossStackReferencer", "ImagesBucket" ] }
+                            },
+                            {
+                                "Name" : "DB_HOST",
+                                "Value" : { "Fn::GetAtt" : [ "LBRCrossStackReferencer", "DBHost" ] }
+                            },
+                            {
+                                "Name" : "DB_USER",
+                                "Value" : { "Ref" : "DBUser" }
+                            },
+                            {
+                                "Name" : "DB_PASS",
+                                "Value" : { "Ref" : "DBPassword" }
+                            },
+                            {
+                                "Name" : "DB_NAME",
+                                "Value" : { "Fn::GetAtt" : [ "LBRCrossStackReferencer", "DBName" ] }
+                            },
+                            {
+                                "Name" : "WATERMARK",
+                                "Value" : { "Ref" : "ImageWatermark" }
+                            }
+                        ],
+                        "MountPoints" : [
+                            {
+                                "ContainerPath" : "/var/log",
+                                "SourceVolume" : "logs",
+                                "ReadOnly" : false
+                            }
+                        ]
+                    }
+                ],
+                "Volumes" : [
+                    {
+                        "Name" : "logs",
+                        "Host" : {
+                            "SourcePath" : "/var/log/images-processor"
+                        }
+                    }
+                ]
+            }
+        },
+        "Service" : {
+            "Type" : "AWS::ECS::Service",
+            "Condition" : "isActive",
+            "Properties" : {
+                "Cluster" : { "Fn::GetAtt" : [ "LBRCrossStackReferencer", "ECSCluster" ] },
+                "DesiredCount" : { "Ref" : "ServiceDesiredCount" },
+                "TaskDefinition" : { "Ref" : "Taskdefinition" }
+            }
+        }
+    },
+
+    "Outputs" : {
+    }
+}

@@ -1,0 +1,830 @@
+{
+    "AWSTemplateFormatVersion" : "2010-09-09",
+    "Description" : "Base CloudFormation template for ECS cluster with RDS instance, SQS Queue and S3 bucket",
+
+    "Parameters" : {
+        "AdminLocation" : {
+            "Description" : "The IP range to whitelist for admin access",
+            "Type" : "String",
+            "MinLength" : "9",
+            "MaxLength" : "18",
+            "AllowedPattern" : "^([0-9]+\\.){3}[0-9]+\\/[0-9]+$",
+            "Default" : "0.0.0.0/0",
+            "ConstraintDescription" : "must be a valid CIDR."
+        },
+        "AMI" : {
+            "Description" : "Amazon ECS-optimized AMI",
+            "Type" : "String",
+            "Default" : "ami-f1b46b82"
+        },
+        "ConfigFile" : {
+            "Description" : "S3 Object with configuration for ECS-agent",
+            "Type" : "String",
+            "Default" : "ecs.config",
+            "ConstraintDescription" : "must exists before launching new environment."
+        },
+        "DBInstanceClass" : {
+            "Description" : "RDS instance type",
+            "Type" : "String",
+            "AllowedValues" : [ "db.t2.micro", "db.t2.small", "db.t2.medium" ],
+            "Default" : "db.t2.micro"
+        },
+        "DBName" : {
+            "Description" : "Database name",
+            "Type" : "String",
+            "MinLength" : "1",
+            "AllowedPattern" : "[a-zA-Z][a-zA-Z0-9]*",
+            "Default" : "ClusterDatabase",
+            "ConstraintDescription" : "must begin with a letter and contain only alphanumeric characters."
+        },
+        "DBPassword" : {
+            "Description" : "Database admin account password",
+            "Type" : "String",
+            "NoEcho" : "true",
+            "MinLength" : "8",
+            "MaxLength" : "41",
+            "AllowedPattern" : "[a-zA-Z0-9]*",
+            "ConstraintDescription" : "must contain only alphanumeric characters."
+        },
+        "DBUser" : {
+            "Description" : "Database admin account name",
+            "Type" : "String",
+            "NoEcho" : "true",
+            "MinLength" : "1",
+            "MaxLength" : "16",
+            "AllowedPattern" : "[a-zA-Z][a-zA-Z0-9]*",
+            "ConstraintDescription" : "must begin with a letter and contain only alphanumeric characters."
+        },
+        "DesiredCapacity" : {
+            "Description" : "Number of instances to launch in your ECS cluster",
+            "Type" : "Number",
+            "Default" : "0"
+        },
+        "ImagesBucketName" : {
+            "Description" : "Name of the S3 bycket where images will be stored",
+            "Type" : "String"
+        },
+        "InstanceType" : {
+            "Description" : "EC2 instance type",
+            "Type" : "String",
+            "AllowedValues" : [ "t2.micro", "t2.small", "t2.medium", "t2.large" ],
+            "Default" : "t2.micro"
+        },
+        "MaxSize" : {
+            "Description" : "Maximum number of instances that can be launched in your ECS cluster",
+            "Type" : "Number",
+            "Default" : "2"
+        },
+        "SQSQueueName" : {
+            "Description" : "Name of the SQS queue",
+            "Type" : "String"
+        },
+        "SSHKeyName" : {
+            "Description" : "Name of an existing EC2 key pair to enable SSH access to the instances",
+            "Type" : "AWS::EC2::KeyPair::KeyName"
+        }
+    },
+
+    "Mappings" : {
+        "AzMap" : {
+            "A" : { "zone" : "eu-west-1a" },
+            "B" : { "zone" : "eu-west-1b" }
+        },
+        "CidrMap" : {
+            "Any" : { "CIDR" : "0.0.0.0/0" },
+            "VPC" : { "CIDR" : "10.0.1.0/24" },
+            "PublicA" : { "CIDR" : "10.0.1.0/26" },
+            "PrivateA" : { "CIDR" : "10.0.1.64/26" },
+            "PublicB" : { "CIDR" : "10.0.1.128/26" },
+            "PrivateB" : { "CIDR" : "10.0.1.192/26" }
+        },
+        "PortMap" : {
+            "ping" : { "port" : "-1" },
+            "zero" : { "port" : "0" },
+            "ssh" : { "port" : "22" },
+            "http" : { "port" : "80" },
+            "https" : { "port" : "443" },
+            "middle" : { "port" : "1024" },
+            "mysql" : { "port" : "3306" },
+            "http2" : { "port" : "8080" },
+            "last" : { "port" : "65535" }
+        }
+    },
+
+    "Resources" : {
+        "InboundICMPNetworkAclEntry" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "VPC", "CIDR" ] },
+                "Egress" : false,
+                "NetworkAclId" : { "Ref" : "PublicNetworkAcl" },
+                "PortRange" : {
+                    "From" : { "Fn::FindInMap" : [ "PortMap",  "ping",  "port" ] },
+                    "To" : { "Fn::FindInMap" : [ "PortMap", "ping", "port" ] }
+                },
+                "Icmp" : {
+                    "Code" : { "Fn::FindInMap" : [ "PortMap", "ping", "port" ] },
+                    "Type" : { "Fn::FindInMap" : [ "PortMap", "ping", "port" ] }
+                },
+                "Protocol" : 1,
+                "RuleAction" : "allow",
+                "RuleNumber" : 104
+            },
+            "Type" : "AWS::EC2::NetworkAclEntry"
+        },
+        "Inbound1024NetworkAclEntry" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "Any", "CIDR" ] },
+                "Egress" : false,
+                "NetworkAclId" : { "Ref" : "PublicNetworkAcl" },
+                "PortRange" : {
+                    "From" : { "Fn::FindInMap" : [ "PortMap",  "middle",  "port" ] },
+                    "To" : { "Fn::FindInMap" : [ "PortMap", "last", "port" ] }
+                },
+                "Protocol" : 6,
+                "RuleAction" : "allow",
+                "RuleNumber" : 103
+            },
+            "Type" : "AWS::EC2::NetworkAclEntry"
+        },
+        "InboundHTTPSNetworkAclEntry" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "Any", "CIDR" ] },
+                "Egress" : false,
+                "NetworkAclId" : { "Ref" : "PublicNetworkAcl" },
+                "PortRange" : {
+                    "From" : { "Fn::FindInMap" : [ "PortMap",  "https",  "port" ] },
+                    "To" : { "Fn::FindInMap" : [ "PortMap", "https", "port" ] }
+                },
+                "Protocol" : 6,
+                "RuleAction" : "allow",
+                "RuleNumber" : 102
+            },
+            "Type" : "AWS::EC2::NetworkAclEntry"
+        },
+        "InboundHTTPNetworkAclEntry" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "Any", "CIDR" ] },
+                "Egress" : false,
+                "NetworkAclId" : { "Ref" : "PublicNetworkAcl" },
+                "PortRange" : {
+                    "From" : { "Fn::FindInMap" : [ "PortMap",  "http",  "port" ] },
+                    "To" : { "Fn::FindInMap" : [ "PortMap", "http", "port" ] }
+                },
+                "Protocol" : 6,
+                "RuleAction" : "allow",
+                "RuleNumber" : 101
+            },
+            "Type" : "AWS::EC2::NetworkAclEntry"
+        },
+        "InboundSSHNetworkAclEntry" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "Any", "CIDR" ] },
+                "Egress" : false,
+                "NetworkAclId" : { "Ref" : "PublicNetworkAcl" },
+                "PortRange" : {
+                    "From" : { "Fn::FindInMap" : [ "PortMap", "ssh", "port" ] },
+                    "To" : { "Fn::FindInMap" : [ "PortMap", "ssh", "port" ] }
+                },
+                "Protocol" : 6,
+                "RuleAction" : "allow",
+                "RuleNumber" : 100
+            },
+            "Type" : "AWS::EC2::NetworkAclEntry"
+        },
+        "OutboundICMPNetworkAclEntry" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "VPC", "CIDR" ] },
+                "Egress" : true,
+                "NetworkAclId" : { "Ref" : "PublicNetworkAcl" },
+                "PortRange" : {
+                    "From" : { "Fn::FindInMap" : [ "PortMap", "ping", "port" ] },
+                    "To" : { "Fn::FindInMap" : [ "PortMap", "ping", "port" ] }
+                },
+                "Icmp" : {
+                    "Code" : { "Fn::FindInMap" : [ "PortMap", "ping", "port" ] },
+                    "Type" : { "Fn::FindInMap" : [ "PortMap", "ping", "port" ] }
+                },
+                "Protocol" : 1,
+                "RuleAction" : "allow",
+                "RuleNumber" : 101
+            },
+            "Type" : "AWS::EC2::NetworkAclEntry"
+        },
+        "OutboundPublicNetworkAclEntry" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "Any", "CIDR" ] },
+                "Egress" : true,
+                "NetworkAclId" : { "Ref" : "PublicNetworkAcl" },
+                "PortRange" : {
+                    "From" : { "Fn::FindInMap" : [ "PortMap", "zero", "port" ] },
+                    "To" : { "Fn::FindInMap" : [ "PortMap", "last", "port" ] }
+                },
+                "Protocol" : 6,
+                "RuleAction" : "allow",
+                "RuleNumber" : 100
+            },
+            "Type" : "AWS::EC2::NetworkAclEntry"
+        },
+        "InboundPrivateNetworkAclEntry" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "Any", "CIDR" ] },
+                "Egress" : false,
+                "NetworkAclId" : { "Ref" : "PrivateNetworkAcl" },
+                "PortRange" : {
+                    "From" : { "Fn::FindInMap" : [ "PortMap", "zero", "port" ] },
+                    "To" : { "Fn::FindInMap" : [ "PortMap", "last", "port" ] }
+                },
+                "Protocol" : 6,
+                "RuleAction" : "allow",
+                "RuleNumber" : 100
+            },
+            "Type" : "AWS::EC2::NetworkAclEntry"
+        },
+        "OutboundPrivateNetworkAclEntry" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "Any", "CIDR" ] },
+                "Egress" : true,
+                "NetworkAclId" : { "Ref" : "PrivateNetworkAcl" },
+                "PortRange" : {
+                    "From" : { "Fn::FindInMap" : [ "PortMap", "zero", "port" ] },
+                    "To" : { "Fn::FindInMap" : [ "PortMap", "last", "port" ] }
+                },
+                "Protocol" : 6,
+                "RuleAction" : "allow",
+                "RuleNumber" : 100
+            },
+            "Type" : "AWS::EC2::NetworkAclEntry"
+        },
+        "PrivateA" : {
+            "Properties" : {
+                "AvailabilityZone" : { "Fn::FindInMap" : [ "AzMap", "A", "zone" ] },
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "PrivateA", "CIDR" ] },
+                "VpcId" : { "Ref" : "VPC" },
+                "Tags" : [
+                    {
+                        "Key" : "Name",
+                        "Value" : { "Fn::Join" : [ "", [ { "Ref" : "AWS::StackName" }, "-vpc"] ] }
+                    }
+                ]
+            },
+            "Type" : "AWS::EC2::Subnet"
+        },
+        "PrivateASubnetNetworkAclAssociation" : {
+            "Properties" : {
+                "NetworkAclId" : { "Ref" : "PrivateNetworkAcl" },
+                "SubnetId" : { "Ref" : "PrivateA" }
+            },
+            "Type" : "AWS::EC2::SubnetNetworkAclAssociation"
+        },
+        "PrivateB" : {
+            "Properties" : {
+                "AvailabilityZone" : { "Fn::FindInMap" : [ "AzMap", "B", "zone" ] },
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "PrivateB", "CIDR" ] },
+                "VpcId" : { "Ref" : "VPC" },
+                "Tags" : [
+                    {
+                        "Key" : "Name",
+                        "Value" : { "Fn::Join" : [ "", [ { "Ref" : "AWS::StackName" }, "-vpc"] ] }
+                    }
+                ]
+            },
+            "Type" : "AWS::EC2::Subnet"
+        },
+        "PrivateBSubnetNetworkAclAssociation" : {
+            "Properties" : {
+                "NetworkAclId" : { "Ref" : "PrivateNetworkAcl" },
+                "SubnetId" : { "Ref" : "PrivateB" }
+            },
+            "Type" : "AWS::EC2::SubnetNetworkAclAssociation"
+        },
+        "PrivateNetworkAcl" : {
+            "Properties" : {
+                "VpcId" : { "Ref" : "VPC" },
+                "Tags" : [
+                    {
+                        "Key" : "Name",
+                        "Value" : { "Fn::Join" : [ "", [ { "Ref" : "AWS::StackName" }, "-vpc"] ] }
+                    }
+                ]
+            },
+            "Type" : "AWS::EC2::NetworkAcl"
+        },
+        "PublicA" : {
+            "Properties" : {
+                "AvailabilityZone" : { "Fn::FindInMap" : [ "AzMap", "A", "zone" ] },
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "PublicA", "CIDR" ] },
+                "VpcId" : { "Ref" : "VPC" },
+                "Tags" : [
+                    {
+                        "Key" : "Name",
+                        "Value" : { "Fn::Join" : [ "", [ { "Ref" : "AWS::StackName" }, "-vpc"] ] }
+                    }
+                ]
+            },
+            "Type" : "AWS::EC2::Subnet"
+        },
+        "PublicASubnetNetworkAclAssociation" : {
+            "Properties" : {
+                "NetworkAclId" : { "Ref" : "PublicNetworkAcl" },
+                "SubnetId" : { "Ref" : "PublicA" }
+            },
+            "Type" : "AWS::EC2::SubnetNetworkAclAssociation"
+        },
+        "PublicASubnetRouteTableAssociation" : {
+            "Properties" : {
+                "RouteTableId" : { "Ref" : "PublicRouteTable" },
+                "SubnetId" : { "Ref" : "PublicA" }
+            },
+            "Type" : "AWS::EC2::SubnetRouteTableAssociation"
+        },
+        "PublicB" : {
+            "Properties" : {
+                "AvailabilityZone" : { "Fn::FindInMap" : [ "AzMap", "B", "zone" ] },
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "PublicB", "CIDR" ] },
+                "VpcId" : { "Ref" : "VPC" },
+                "Tags" : [
+                    {
+                        "Key" : "Name",
+                        "Value" : { "Fn::Join" : [ "", [ { "Ref" : "AWS::StackName" }, "-vpc"] ] }
+                    }
+                ]
+            },
+            "Type" : "AWS::EC2::Subnet"
+        },
+        "PublicBSubnetNetworkAclAssociation" : {
+            "Properties" : {
+                "NetworkAclId" : { "Ref" : "PublicNetworkAcl" },
+                "SubnetId" : { "Ref" : "PublicB" }
+            },
+            "Type" : "AWS::EC2::SubnetNetworkAclAssociation"
+        },
+        "PublicBSubnetRouteTableAssociation" : {
+            "Properties" : {
+              "RouteTableId" : { "Ref" : "PublicRouteTable" },
+              "SubnetId" : { "Ref" : "PublicB" }
+            },
+            "Type" : "AWS::EC2::SubnetRouteTableAssociation"
+        },
+        "PublicNetworkAcl" : {
+            "Properties" : {
+                "VpcId" : { "Ref" : "VPC" },
+                "Tags" : [
+                    {
+                        "Key" : "Name",
+                        "Value" : { "Fn::Join" : [ "", [ { "Ref" : "AWS::StackName" }, "-vpc"] ] }
+                    }
+                ]
+            },
+            "Type" : "AWS::EC2::NetworkAcl"
+        },
+        "PublicRoute" : {
+            "Properties" : {
+                "DestinationCidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "Any", "CIDR" ] },
+                "GatewayId" : { "Ref" : "InternetGateway" },
+                "RouteTableId" : { "Ref" : "PublicRouteTable" }
+            },
+            "Type" : "AWS::EC2::Route"
+        },
+        "PublicRouteTable" : {
+            "Properties" : {
+                "VpcId" : { "Ref" : "VPC" },
+                "Tags" : [
+                    {
+                        "Key" : "Name",
+                        "Value" : { "Fn::Join" : [ "", [ { "Ref" : "AWS::StackName" }, "-vpc"] ] }
+                    }
+                ]
+            },
+            "Type" : "AWS::EC2::RouteTable"
+        },
+        "InternetGateway" : { "Type" : "AWS::EC2::InternetGateway" },
+        "VPC" : {
+            "Properties" : {
+                "CidrBlock" : { "Fn::FindInMap" : [ "CidrMap", "VPC", "CIDR"] },
+                "EnableDnsHostnames" : true,
+                "EnableDnsSupport" : true,
+                "Tags" : [
+                    {
+                        "Key" : "Name",
+                        "Value" : { "Fn::Join" : [ "", [ { "Ref" : "AWS::StackName" }, "-vpc"] ] }
+                    }
+                ]
+            },
+            "Type" : "AWS::EC2::VPC"
+        },
+        "VPCGatewayAttachment" : {
+            "Properties" : {
+                "InternetGatewayId" : { "Ref" : "InternetGateway" },
+                "VpcId" : { "Ref" : "VPC" }
+            },
+            "Type" : "AWS::EC2::VPCGatewayAttachment"
+        },
+        "InstanceSecurityGroup" : {
+            "Type" : "AWS::EC2::SecurityGroup",
+            "Properties" : {
+                "GroupDescription" : "To allow ingress from EC2 instances in this group.",
+                "SecurityGroupIngress" : [],
+                "VpcId" : { "Ref" : "VPC" }
+            }
+        },
+
+        "RDSSecurityGroup" : {
+            "Type" : "AWS::EC2::SecurityGroup",
+            "Properties" : {
+                "GroupDescription" : "The database access",
+                "SecurityGroupIngress" : [
+                    {
+                        "IpProtocol" : "tcp",
+                        "FromPort" : { "Fn::FindInMap" : [ "PortMap",  "mysql",  "port" ] },
+                        "ToPort" : { "Fn::FindInMap" : [ "PortMap",  "mysql",  "port" ] },
+                        "SourceSecurityGroupId" : { "Ref" : "InstanceSecurityGroup" }
+                    }
+                ],
+                "VpcId" : { "Ref" : "VPC" }
+            }
+        },
+        "RDSSubnetGroup" : {
+            "Type" : "AWS::RDS::DBSubnetGroup",
+            "Properties" : {
+                "DBSubnetGroupDescription" : "RDS Subnet Group",
+                "SubnetIds" : [
+                    { "Ref" : "PrivateA" },
+                    { "Ref" : "PrivateB" }
+                ]
+            }
+        },
+        "RDSDB" : {
+            "Type" : "AWS::RDS::DBInstance",
+            "Properties" : {
+                "Engine" : "MariaDB",
+                "DBName" : { "Ref" : "DBName" },
+                "DBSubnetGroupName" : { "Ref" : "RDSSubnetGroup" },
+                "MasterUsername" : { "Ref" : "DBUser" },
+                "DBInstanceClass" : { "Ref" : "DBInstanceClass" },
+                "AllocatedStorage" : "5",
+                "MasterUserPassword" : { "Ref" : "DBPassword" },
+                "VPCSecurityGroups" : [ { "Fn::GetAtt" : [ "RDSSecurityGroup", "GroupId" ] } ]
+            }
+        },
+
+        "ECSServiceRole" : {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+                "AssumeRolePolicyDocument" : {
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Principal" : { "Service" : [ "ecs.amazonaws.com" ] },
+                            "Action" : [ "sts:AssumeRole" ]
+                        }
+                    ]
+                },
+                "Path" : "/",
+                "Policies" : [
+                    {
+                        "PolicyName" : "ecs-service",
+                        "PolicyDocument" : {
+                            "Statement" : [
+                                {
+                                    "Effect" : "Allow",
+                                    "Action" : [
+                                        "elasticloadbalancing:Describe*",
+                                        "elasticloadbalancing:DeregisterInstancesFromLoadBalancer",
+                                        "elasticloadbalancing:RegisterInstancesWithLoadBalancer",
+                                        "ec2:Describe*",
+                                        "ec2:AuthorizeSecurityGroupIngress"
+                                    ],
+                                    "Resource" : "*"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "EC2Role" : {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+                "AssumeRolePolicyDocument" : {
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Principal" : { "Service" : [ "ec2.amazonaws.com" ] },
+                            "Action" : [ "sts:AssumeRole" ]
+                        }
+                    ]
+                },
+                "Path" : "/",
+                "Policies" : [
+                    {
+                        "PolicyName" : "ecs-service",
+                        "PolicyDocument" : {
+                            "Statement" : [
+                                {
+                                    "Effect" : "Allow",
+                                    "Action" : [
+                                        "ecs:CreateCluster",
+                                        "ecs:DeregisterContainerInstance",
+                                        "ecs:DiscoverPollEndpoint",
+                                        "ecs:Poll",
+                                        "ecs:RegisterContainerInstance",
+                                        "ecs:StartTelemetrySession",
+                                        "ecs:Submit*"
+                                    ],
+                                    "Resource" : [ "*" ]
+                                },
+                                {
+                                    "Effect" : "Allow",
+                                    "Action" : [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                    ],
+                                    "Resource" : [ "arn:aws:logs:*:*:*" ]
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "PolicyName" : "s3-images-bucket",
+                        "PolicyDocument" : {
+                            "Statement" : [
+                                {
+                                    "Effect" : "Allow",
+                                    "Action" : [
+                                        "s3:*"
+                                    ],
+                                    "Resource" : [
+                                        { "Fn::Join" : [ "", [ "arn:aws:s3:::", { "Ref" : "ImagesBucketName" } ] ] },
+                                        { "Fn::Join" : [ "", [ "arn:aws:s3:::", { "Ref" : "ImagesBucketName" }, "/*" ] ] }
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "PolicyName" : "sqs-images-queue",
+                        "PolicyDocument" : {
+                            "Statement" : [
+                                {
+                                    "Effect" : "Allow",
+                                    "Action" : [
+                                        "sqs:*"
+                                    ],
+                                    "Resource" : { "Fn::Join" : [ "", [ "arn:aws:sqs:", { "Ref" : "AWS::Region" }, ":", { "Ref" : "AWS::AccountId" }, ":", { "Ref" : "SQSQueueName" } ] ] }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "EC2InstanceProfile" : {
+            "Type" : "AWS::IAM::InstanceProfile",
+            "Properties" : {
+                "Path" : "/",
+                "Roles" : [
+                    {
+                        "Ref" : "EC2Role"
+                    }
+                ]
+            }
+        },
+        "ECSCluster" : {
+            "Type" : "AWS::ECS::Cluster"
+        },
+        "ECSELBSecurityGroup" : {
+            "Type" : "AWS::EC2::SecurityGroup",
+            "Properties" : {
+                "GroupDescription" : "Security group for application load balancer",
+                "SecurityGroupIngress" : [
+                    {
+                        "IpProtocol" : "tcp",
+                        "CidrIp" : { "Fn::FindInMap" : [ "CidrMap", "Any", "CIDR" ] },
+                        "FromPort" : { "Fn::FindInMap" : [ "PortMap",  "http",  "port" ] },
+                        "ToPort" : { "Fn::FindInMap" : [ "PortMap",  "http",  "port" ] }
+                    }
+                ],
+                "VpcId" : { "Ref" : "VPC" }
+            }
+        },
+        "EcsAppSecurityGroup" : {
+            "Type" : "AWS::EC2::SecurityGroup",
+            "Properties" : {
+                "VpcId" : { "Ref" : "VPC" },
+                "GroupDescription" : "Enable HTTP (80 and 8080) access from the load balancer only",
+                "SecurityGroupIngress" : [
+                    {
+                        "IpProtocol" : "tcp",
+                        "FromPort" : { "Fn::FindInMap" : [ "PortMap",  "http",  "port" ] },
+                        "ToPort" : { "Fn::FindInMap" : [ "PortMap",  "http",  "port" ] },
+                        "SourceSecurityGroupId" : { "Ref" : "ECSELBSecurityGroup" }
+                    },
+                    {
+                        "IpProtocol" : "tcp",
+                        "FromPort" : { "Fn::FindInMap" : [ "PortMap",  "http2",  "port" ] },
+                        "ToPort" : { "Fn::FindInMap" : [ "PortMap",  "http2",  "port" ] },
+                        "SourceSecurityGroupId" : { "Ref" : "ECSELBSecurityGroup" }
+                    }
+                ]
+            }
+        },
+        "EcsAdminSecurityGroup" : {
+            "Type" : "AWS::EC2::SecurityGroup",
+            "Properties" : {
+                "VpcId" : { "Ref" : "VPC" },
+                "GroupDescription" : "Enable SSH and direct HTTP (80 and 8080) access from admin location",
+                "SecurityGroupIngress" : [
+                    {
+                        "IpProtocol" : "tcp",
+                        "FromPort" : { "Fn::FindInMap" : [ "PortMap",  "ssh",  "port" ] },
+                        "ToPort" : { "Fn::FindInMap" : [ "PortMap",  "ssh",  "port" ] },
+                        "CidrIp" : { "Ref" : "AdminLocation" }
+                    },
+                    {
+                        "IpProtocol" : "tcp",
+                        "FromPort" : { "Fn::FindInMap" : [ "PortMap",  "http",  "port" ] },
+                        "ToPort" : { "Fn::FindInMap" : [ "PortMap",  "http",  "port" ] },
+                        "CidrIp" : { "Ref" : "AdminLocation" }
+                    },
+                    {
+                        "IpProtocol" : "tcp",
+                        "FromPort" : { "Fn::FindInMap" : [ "PortMap",  "http2",  "port" ] },
+                        "ToPort" : { "Fn::FindInMap" : [ "PortMap",  "http2",  "port" ] },
+                        "CidrIp" : { "Ref" : "AdminLocation" }
+                    }
+                ]
+            }
+        },
+        "ECSAutoScalingGroup" : {
+            "Type" : "AWS::AutoScaling::AutoScalingGroup",
+            "Properties" : {
+                "VPCZoneIdentifier" : [
+                    { "Ref" : "PublicA" },
+                    { "Ref" : "PublicB" }
+                ],
+                "LaunchConfigurationName" : { "Ref" : "ContainerInstances" },
+                "MinSize" : "0",
+                "MaxSize" : { "Ref" : "MaxSize" },
+                "DesiredCapacity" : { "Ref" : "DesiredCapacity" },
+                "Tags" : [
+                    {
+                        "Key" : "Name",
+                        "Value" : { "Fn::Join" : [ "", [ { "Ref" : "AWS::StackName" }, ":", "container-instance" ] ] },
+                        "PropagateAtLaunch" : "true"
+                    },
+                    {
+                        "Key" : "StackName",
+                        "Value" : { "Ref" : "AWS::StackName" },
+                        "PropagateAtLaunch" : "true"
+                    }
+                ]
+            }
+        },
+        "ContainerInstances" : {
+            "Type" : "AWS::AutoScaling::LaunchConfiguration",
+            "Properties" : {
+                "ImageId" : { "Ref" : "AMI" },
+                "InstanceType"   : { "Ref" : "InstanceType" },
+                "IamInstanceProfile" : { "Ref" : "EC2InstanceProfile" },
+                "AssociatePublicIpAddress" : true,
+                "SecurityGroups" : [
+                    { "Ref" : "EcsAppSecurityGroup" },
+                    { "Ref" : "InstanceSecurityGroup" },
+                    { "Ref" : "EcsAdminSecurityGroup" }
+                ],
+                "KeyName" : { "Ref" : "SSHKeyName" },
+                "UserData" : { "Fn::Base64" : { "Fn::Join" : [ "", [
+                    "#!/bin/bash -xe\n",
+                    "yum install -y ecs-init aws-cli python27-pip\n",
+                    "# Configure additional swap file\n",
+                    "/usr/bin/fallocate -l2048M /var/swapfile && /sbin/mkswap /var/swapfile && /bin/chmod 0600 /var/swapfile && /sbin/swapon /var/swapfile\n",
+                    "# Configure ECS cluster\n",
+                    "echo ECS_CLUSTER=", { "Ref" : "ECSCluster" }, " >> /etc/ecs/ecs.config\n",
+                    "# Configure CW Logs Agent\n",
+                    "curl -o /usr/local/bin/awslogs-agent-setup.py https://s3.amazonaws.com/aws-cloudwatch/downloads/latest/awslogs-agent-setup.py && chmod a+x /usr/local/bin/awslogs-agent-setup.py\n",
+                    "cat<<'_EOF_' >/tmp/awslogs-agent.cfg\n",
+                    "[general]\n",
+                    "state_file = /var/awslogs/state/agent-state\n\n",
+                    "[IU-Service]\n",
+                    "file = /var/log/images-uploader/images-uploader.log\n",
+                    "log_group_name = images-uploader\n",
+                    "log_stream_name = images-uploader.log\n",
+                    "datetime_format = %Y-%m-%d %H:%M:%S\n",
+                    "buffer_duration = 5000\n",
+                    "initial_position = start_of_file\n\n",
+                    "[IU-Nginx-Proxy-Access]\n",
+                    "file = /var/log/nginx-proxy/access.log\n",
+                    "log_group_name = images-uploader\n",
+                    "log_stream_name = nginx_access.log\n",
+                    "datetime_format = %d/%b/%Y:%H:%M:%S\n",
+                    "buffer_duration = 5000\n",
+                    "initial_position = start_of_file\n\n",
+                    "[IU-Nginx-Proxy-Error]\n",
+                    "file = /var/log/nginx-proxy/error.log\n",
+                    "log_group_name = images-uploader\n",
+                    "log_stream_name = nginx_error.log\n",
+                    "datetime_format = %d/%b/%Y:%H:%M:%S\n",
+                    "buffer_duration = 5000\n",
+                    "initial_position = start_of_file\n\n",
+                    "[IP-Service]\n",
+                    "file = /var/log/images-processor/images-processor.log\n",
+                    "log_group_name = images-processor\n",
+                    "log_stream_name = images-processor.log\n",
+                    "datetime_format = %Y-%m-%d %H:%M:%S\n",
+                    "buffer_duration = 5000\n",
+                    "initial_position = start_of_file\n\n",
+                    "[PMA-Service-Access]\n",
+                    "file = /var/log/pma/access.log\n",
+                    "log_group_name = phpMyAdmin\n",
+                    "log_stream_name = pma_access.log\n",
+                    "datetime_format = %d/%b/%Y:%H:%M:%S\n",
+                    "buffer_duration = 5000\n",
+                    "initial_position = start_of_file\n\n",
+                    "[PMA-Service-Error]\n",
+                    "file = /var/log/pma/error.log\n",
+                    "log_group_name = phpMyAdmin\n",
+                    "log_stream_name = pma_error.log\n",
+                    "datetime_format = %Y%m/%d %H:%M:%S\n",
+                    "buffer_duration = 5000\n",
+                    "initial_position = start_of_file\n",
+                    "_EOF_\n",
+                    "/usr/local/bin/awslogs-agent-setup.py -n -r ", { "Ref" : "AWS::Region" }, " -c /tmp/awslogs-agent.cfg > /tmp/awslogs-agent-setup.log 2>&1\n",
+                    "# Configuration for nginx-proxy container\n",
+                    "mkdir -p /etc/nginx_config\n",
+                    "cat<<'_EOF_' >/etc/nginx_config/images_uploader.conf\n",
+                    "server {\n",
+                    "    listen 80 default_server;\n",
+                    "    \n",
+                    "    client_max_body_size 32m;\n",
+                    "    \n",
+                    "    real_ip_header X-Forwarded-For;\n",
+                    "    set_real_ip_from 0.0.0.0/0;\n",
+                    "    \n",
+                    "    location / {\n",
+                    "        proxy_pass http://ImagesUploader:8080;\n",
+                    "    }\n",
+                    "}\n",
+                    "_EOF_\n"
+                ] ] } }
+            }
+        },
+
+        "ImagesQueue" : {
+            "Type" : "AWS::SQS::Queue",
+            "Properties" : {
+                "QueueName" : { "Ref" : "SQSQueueName" },
+                "VisibilityTimeout" : "40"
+            }
+        },
+        "ImagesBucket" : {
+            "Type" : "AWS::S3::Bucket",
+            "Properties" : {
+              "BucketName" : { "Ref" : "ImagesBucketName" }
+            }
+        }
+    },
+
+    "Outputs" : {
+        "DBHost" : {
+            "Description" : "RDS endpoint address",
+            "Value" : { "Fn::GetAtt" : [ "RDSDB", "Endpoint.Address" ] }
+        },
+        "DBName" : {
+            "Description" : "RDS database name for application",
+            "Value" : { "Ref" : "DBName" }
+        },
+        "ECSCluster" : {
+            "Description" : "Name of the ECS cluster",
+            "Value" : { "Ref" : "ECSCluster" }
+        },
+        "ECSELBSecurityGroup" : {
+            "Description" : "Security group for application load balancer",
+            "Value" : { "Ref" : "ECSELBSecurityGroup" }
+        },
+        "ECSServiceRole" : {
+            "Description" : "ECS service IAM role name",
+            "Value" : { "Ref" : "ECSServiceRole" }
+        },
+        "ImagesBucket" : {
+            "Description" : "Name of the bucket for images storage",
+            "Value" : { "Ref" : "ImagesBucket" }
+        },
+        "ImagesQueue" : {
+            "Description" : "Name of the SQS queue for images information",
+            "Value" : { "Fn::GetAtt" : [ "ImagesQueue", "QueueName"] }
+        },
+        "PubSubnetA" : {
+            "Description" : "Id of the Subnets",
+            "Value" : { "Ref" : "PublicA" }
+        },
+        "PubSubnetB" : {
+            "Description" : "Id of the Subnets",
+            "Value" : { "Ref" : "PublicB" }
+        },
+        "VPC" : {
+            "Description" : "Id of the VPC",
+            "Value" : { "Ref" : "VPC" }
+        }
+    }
+}
